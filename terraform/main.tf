@@ -1,178 +1,127 @@
 terraform {
-  backend "azurerm" {}
+  backend "s3" {
+    encrypt = true
+  }
   required_providers {
-    azurerm = {
-      source  = "hashicorp/azurerm"
-      version = "~> 3.100"
+    aws = {
+      source = "hashicorp/aws"
+      # Pin below 5.83 — that release introduced `password_wo` for
+      # aws_db_instance and changed plan-time behavior so the literal
+      # `password` argument no longer shows in the plan output and is
+      # treated as if `manage_master_user_password = true`. Result was
+      # an opaque "Invalid master password" error at apply time even
+      # when DB_PASSWORD was correctly populated.
+      # 5.82.x is the last release with the predictable password=... behavior.
+      version = ">= 5.0.0, < 5.83.0"
     }
   }
 }
 
-provider "azurerm" {
-  features {}
+provider "aws" {
+  region = var.aws_region
 }
 
 variable "project_name" {
   type = string
 }
-
-variable "azure_region" {
+variable "aws_region" {
   type    = string
   default = "eastus"
 }
-
-variable "azure_db_region" {
-  type    = string
-  default = ""
-}
-
-variable "container_image" {
-  type    = string
-  default = "placeholder"
-}
-
-variable "app_port" {
-  type    = number
-  default = 3000
-}
-
-variable "replica_count" {
-  type    = number
-  default = 2
-}
-
-variable "node_count" {
-  type    = number
-  default = 1
-}
-
-variable "vm_size" {
-  type    = string
-  # AKS has its own per-subscription SKU allowlist that's NARROWER than plain
-  # VM SKUs. Free-trial subscriptions in many regions only allow DC-series
-  # (confidential compute) for AKS. Standard_DC2as_v5 is the smallest one
-  # that's broadly available; users with paid subscriptions can override.
-  default = "Standard_DC2ads_v5"
-}
-
-variable "kubernetes_version" {
+variable "public_key" {
   type = string
-  # AKS retires versions on a rolling cadence; older versions like 1.30 became
-  # LTS-only (Premium tier) and Free tier rejects them with K8sVersionNotSupported.
-  # Leave empty to let Azure choose its current default for the region.
-  default = ""
 }
-
-variable "registry_server" {
+variable "instance_type" {
   type    = string
-  default = "ghcr.io"
+  default = "t3.micro"
 }
-
-variable "registry_username" {
-  type    = string
-  default = ""
-}
-
-variable "registry_password" {
-  type      = string
-  sensitive = true
-  default   = ""
-}
-
 variable "db_name" {
   type    = string
   default = ""
 }
-
 variable "db_username" {
   type    = string
-  default = "appuser"
+  default = ""
 }
-
 variable "db_password" {
   type      = string
   sensitive = true
   default   = ""
 }
 
-locals {
-  name_safe = substr(lower(replace(replace(var.project_name, "_", "-"), " ", "-")), 0, 24)
-  namespace = local.name_safe
-  effective_db_region    = var.azure_db_region != "" ? var.azure_db_region : var.azure_region
-  db_is_cross_region     = var.azure_db_region != "" && var.azure_db_region != var.azure_region
-  _db_name               = var.db_name != "" ? var.db_name : "${replace(var.project_name, "-", "_")}db"
-  _db_port               = "3306"
-  _db_scheme             = "mysql"
+data "aws_vpc" "default" {
+  default = true
 }
 
-resource "azurerm_resource_group" "rg" {
-  name     = "${var.project_name}-rg"
-  location = var.azure_region
-  tags = {
-    Project   = var.project_name
-    ManagedBy = "udap"
+data "aws_subnets" "default" {
+  filter {
+    name   = "vpc-id"
+    values = [data.aws_vpc.default.id]
+  }
+  filter {
+    name   = "availabilityZone"
+    values = ["${var.aws_region}a", "${var.aws_region}b", "${var.aws_region}c"]
   }
 }
 
-resource "azurerm_resource_group" "db_rg" {
-  count    = local.db_is_cross_region ? 1 : 0
-  name     = "${var.project_name}-db-rg"
-  location = var.azure_db_region
-  tags = {
-    Project   = var.project_name
-    ManagedBy = "udap"
+data "aws_ami" "ubuntu" {
+  most_recent = true
+  owners      = ["099720109477"]
+  filter {
+    name   = "name"
+    values = ["ubuntu/images/hvm-ssd/ubuntu-*-22.04-amd64-server-*"]
+  }
+  filter {
+    name   = "virtualization-type"
+    values = ["hvm"]
   }
 }
 
-locals {
-  db_resource_group_name = local.db_is_cross_region ? azurerm_resource_group.db_rg[0].name : azurerm_resource_group.rg.name
-}
-
-resource "azurerm_kubernetes_cluster" "aks" {
-  name                = "${var.project_name}-aks"
-  location            = azurerm_resource_group.rg.location
-  resource_group_name = azurerm_resource_group.rg.name
-  dns_prefix          = local.name_safe
-  # Omit kubernetes_version when blank so Azure picks the current default for
-  # the region. Pinning to a specific version (e.g. 1.30.x) breaks once Azure
-  # moves that version to LTS-only.
-  kubernetes_version  = var.kubernetes_version != "" ? var.kubernetes_version : null
-  sku_tier            = "Free"
-
-  default_node_pool {
-    name       = "default"
-    node_count = var.node_count
-    vm_size    = var.vm_size
-    type       = "VirtualMachineScaleSets"
-  }
-
-  identity {
-    type = "SystemAssigned"
-  }
-
-  network_profile {
-    network_plugin    = "kubenet"
-    load_balancer_sku = "standard"
-  }
-
-  tags = {
-    Project   = var.project_name
-    ManagedBy = "udap"
+resource "aws_key_pair" "deployer" {
+  key_name   = "${var.project_name}-key"
+  public_key = var.public_key
+  lifecycle {
+    ignore_changes = [public_key]
   }
 }
 
-resource "azurerm_mysql_flexible_server" "db" {
-  name                          = "${var.project_name}-db"
-  resource_group_name           = local.db_resource_group_name
-  location                      = local.effective_db_region
-  version                       = "8.0.21"
-  administrator_login           = var.db_username != "" ? var.db_username : "appuser"
-  administrator_password        = var.db_password
-  zone                          = "1"
-  sku_name                      = "B_Standard_B1ms"
-  public_network_access_enabled = true
-  storage {
-    size_gb = 20
+resource "aws_security_group" "sg" {
+  name        = "${var.project_name}-sg"
+  description = "UDAP managed"
+  vpc_id      = data.aws_vpc.default.id
+
+  ingress {
+    from_port   = 22
+    to_port     = 22
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+  ingress {
+    from_port   = 80
+    to_port     = 80
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+  ingress {
+    from_port   = 443
+    to_port     = 443
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+  ingress {
+    from_port   = 3000
+    to_port     = 3000
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+  lifecycle {
+    create_before_destroy = true
   }
   tags = {
     Project   = var.project_name
@@ -180,51 +129,84 @@ resource "azurerm_mysql_flexible_server" "db" {
   }
 }
 
-resource "azurerm_mysql_flexible_server_firewall_rule" "allow_azure" {
-  name                = "allow-azure-services"
-  resource_group_name = local.db_resource_group_name
-  server_name         = azurerm_mysql_flexible_server.db.name
-  start_ip_address    = "0.0.0.0"
-  end_ip_address      = "0.0.0.0"
+resource "aws_instance" "server" {
+  ami                    = data.aws_ami.ubuntu.id
+  instance_type          = var.instance_type
+  key_name               = aws_key_pair.deployer.key_name
+  subnet_id              = tolist(data.aws_subnets.default.ids)[0]
+  vpc_security_group_ids = [aws_security_group.sg.id]
+
+  root_block_device {
+    volume_size = 20
+    volume_type = "gp3"
+  }
+
+  tags = {
+    Name      = var.project_name
+    Project   = var.project_name
+    ManagedBy = "udap"
+  }
 }
 
-resource "azurerm_mysql_flexible_database" "appdb" {
-  name                = local._db_name
-  resource_group_name = local.db_resource_group_name
-  server_name         = azurerm_mysql_flexible_server.db.name
-  charset             = "utf8mb4"
-  collation           = "utf8mb4_unicode_ci"
+resource "aws_db_subnet_group" "main" {
+  name       = "${var.project_name}-db-subnet"
+  subnet_ids = data.aws_subnets.default.ids
+  tags = {
+    Project   = var.project_name
+    ManagedBy = "udap"
+  }
 }
 
-output "cluster_name" {
-  value = azurerm_kubernetes_cluster.aks.name
+resource "aws_security_group" "rds_sg" {
+  name        = "${var.project_name}-rds-sg"
+  description = "RDS security group"
+  vpc_id      = data.aws_vpc.default.id
+  ingress {
+    from_port       = 3306
+    to_port         = 3306
+    protocol        = "tcp"
+    security_groups = [aws_security_group.sg.id]
+  }
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+  lifecycle {
+    create_before_destroy = true
+  }
 }
 
-output "resource_group_name" {
-  value = azurerm_resource_group.rg.name
+resource "aws_db_instance" "main" {
+  identifier             = "${var.project_name}-db"
+  engine                 = "mysql"
+  engine_version         = "8.0"
+  instance_class         = "db.t3.micro"
+  allocated_storage      = 20
+  storage_type           = "gp2"
+  db_name                = var.db_name != "" ? var.db_name : "${replace(var.project_name, "-", "_")}db"
+  username               = var.db_username != "" ? var.db_username : "appuser"
+  password               = var.db_password
+  db_subnet_group_name   = aws_db_subnet_group.main.name
+  vpc_security_group_ids = [aws_security_group.rds_sg.id]
+  skip_final_snapshot    = true
+  publicly_accessible    = false
+  tags = {
+    Project   = var.project_name
+    ManagedBy = "udap"
+  }
 }
 
-output "namespace" {
-  value = local.namespace
+output "public_ip" {
+  value = aws_instance.server.public_ip
 }
-
-output "app_port" {
-  value = var.app_port
+output "instance_id" {
+  value = aws_instance.server.id
 }
-
-output "db_host" {
-  value = azurerm_mysql_flexible_server.db.fqdn
+output "rds_endpoint" {
+  value = aws_db_instance.main.address
 }
-
-output "db_port" {
-  value = local._db_port
-}
-
-output "db_name" {
-  value = local._db_name
-}
-
-output "db_username" {
-  value     = var.db_username
-  sensitive = true
+output "rds_port" {
+  value = aws_db_instance.main.port
 }
